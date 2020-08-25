@@ -1,0 +1,378 @@
+---
+title: "Hacker_Earth"
+author: "Christopher Okoth"
+date: "8/11/2020"
+output: html_document
+---
+```{r}
+# load the libraries I will use
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(ggsci)
+```
+
+
+
+```{r}
+#load the two sets of data 
+df_train <- readr::read_csv(file.choose())
+df_test <- read.csv(file.choose())
+```
+
+### A bit of data exploration 
+```{r}
+df_train %>% view()
+
+df_train %>% count(color_type,sort = T)
+```
+
+
+```{r}
+df_train %>% skimr::skim()
+```
+
+### first code them into factors
+```{r}
+df_train <- df_train %>% mutate(pet_id=factor(pet_id),
+                    color_type=factor(color_type),
+                    breed_category=factor(breed_category),
+                    pet_category=factor(pet_category),
+                    x1=factor(X1),
+                    x2=factor(X2),
+                    condition=factor(condition)) %>% janitor::clean_names()
+```
+
+
+
+## we will impute the condition section 
+```{r}
+rec_imput <- recipe(pet_category~condition+color_type+length_m+height_cm+x1+x2,data = df_train) %>% step_bagimpute(all_predictors())
+
+df_train_imputed <- prep(rec_imput) %>% juice()
+df_train_ready <- df_train_imputed %>%
+  select(condition) %>% 
+  bind_cols(df_train %>% select(-condition)) 
+
+df_train_ready %>% count(pet_category)
+```
+
+This is a multiclass classification  problem but we might need to generate synthetic samples for the pet category as there is some class imbalance seemingly 
+
+## Feature Egineering bit 
+```{r}
+pet_recipe <- recipe(breed_category~.,data = df_train_ready) %>% 
+  step_rm(x1_2,x2_2,pet_id) %>% 
+  step_date(issue_date,features = c("month", "year")) %>% 
+  step_date(listing_date,features = c( "month","year")) %>% 
+  step_rm(listing_date,issue_date)  
+
+df_new <- prep(pet_recipe) %>% juice()
+
+df_new <-df_new %>%  mutate(listing_date_year=factor(listing_date_year),
+                            issue_date_year=factor(issue_date_year),
+                            height_cm=height_cm)
+```
+
+
+
+
+
+
+### splitting the data into training and testing sets 
+```{r}
+pet_split <- initial_split(df_new,strata = breed_category)
+pet_test <- testing(pet_split)
+pet_train <- training(pet_split)
+
+pet_train <- pet_train %>% 
+  select(condition,color_type,length_m,height_cm,x1,x2,pet_category,breed_category,issue_date_year)
+pet_test <- pet_test %>% 
+  select(condition,color_type,length_m,height_cm,x1,x2,pet_category,breed_category,issue_date_year)
+```
+
+
+
+## Model selection
+We start with a random forest model 
+
+```{r}
+set.seed(123)
+model_rf <- rand_forest() %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+res <- model_rf %>% fit(breed_category~.,data=pet_train) %>% 
+  predict(pet_test) %>% 
+  bind_cols(pet_test %>% select(breed_category))
+res %>% conf_mat(.pred_class,breed_category) %>% 
+  summary()
+
+## let understand the feature importance in the random forest model
+model_rf %>% 
+  set_engine("ranger",importance="permutation") %>% 
+  fit(breed_category~.,data=pet_train) %>% 
+  vip::vip(geom="col")
+```
+
+
+## Then let us try logistic regression
+```{r}
+glm_spec <- logistic_reg() %>% 
+  set_engine("glm")
+res_glm <-glm_spec %>% fit(breed_category~.,data=pet_train %>% select(-color_type)) %>% 
+  predict(pet_test %>% select(-color_type)) %>% 
+  bind_cols(pet_test %>% select(breed_category))
+res_glm %>% conf_mat(.pred_class,breed_category) %>% 
+  summary()
+```
+
+So out of the gate we cannot use the logistic regression . The ccuracy is comparatively minimal 
+
+
+## Let us try xg boost 
+```{r}
+pet_boost <- boost_tree() %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost")
+res_boost <- pet_boost %>% fit(breed_category~.,data=pet_train) %>% 
+  predict(pet_test) %>% 
+  bind_cols(pet_test %>% select(breed_category))
+
+res_boost %>% conf_mat(.pred_class,breed_category) %>% 
+  summary()
+```
+
+Performing actually better than random forest in this regard so the two are candidates to be tuned 
+
+### Then we try support vector machines 
+
+```{r}
+model_svm <- svm_rbf() %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification") 
+res_svm <- model_svm %>% fit(breed_category~.,data=pet_train) %>% 
+  predict(pet_test) %>% 
+  bind_cols(pet_test %>% select(breed_category))
+res_svm %>% conf_mat(.pred_class,breed_category) %>% 
+  summary()
+```
+
+
+
+These models are pretty close in performance by default ...let us try tuning the random forest and the boost model and see the difference 
+
+
+### Hyperparameter optimization
+#### Random Forest 
+```{r}
+set.seed(1234)
+pet_folds <- vfold_cv(v = 5,strata = breed_category,data = pet_train)
+
+rand_spec <- rand_forest(mtry = tune(),
+            trees = 1000,
+            min_n = tune()) %>% set_mode("classification") %>% 
+  set_engine("ranger")
+
+pet_wf <- workflow() %>% 
+  add_formula(breed_category~.) %>% 
+  add_model(rand_spec)
+
+rand_res <- tune_grid(
+  pet_wf,grid = 5,resamples = pet_folds,
+  control = control_resamples(save_pred = F)
+)
+
+best_params <- rand_res  %>% 
+  select_best("roc_auc")
+
+finalize_model(rand_spec,best_params) %>% fit(breed_category~.,data=pet_train) %>% 
+  predict(pet_test) %>% 
+  bind_cols(pet_test %>% select(breed_category)) %>% conf_mat(.pred_class,breed_category) %>% 
+  summary()
+```
+
+
+
+## tuned xgboost 
+
+We will use a space filling design 
+```{r}
+pet_xgb <- boost_tree(
+  mtry = tune(),
+  trees = 100,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+pet_grid <- grid_latin_hypercube(
+  finalize(mtry(),pet_train),
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  sample_size=sample_prop(),
+  loss_reduction(),
+  size = 4
+  )
+
+boost_wf <- workflow() %>% 
+  add_formula(breed_category~.) %>% 
+  add_model(pet_xgb)
+set.seed(124)
+
+xgb_res <- tune_grid(
+ boost_wf,
+  resamples = pet_folds,
+  grid = pet_grid,
+  control = control_resamples(verbose =TRUE,save_pred = T)
+)
+
+
+xgb_res %>% collect_predictions() %>% 
+  conf_mat(.pred_class,breed_category) %>% 
+  summary()
+```
+
+
+
+## Let me make the final prediction on the pet category 
+
+Transform the test data then predict with the model 
+
+```{r}
+df_test
+```
+
+```{r}
+df_test <- df_test %>% mutate(
+                    color_type=factor(color_type),
+                    x1=factor(X1),
+                    x2=factor(X2),
+                    condition=factor(condition)) %>% janitor::clean_names()
+```
+
+```{r}
+df_test %>% count(condition)
+```
+
+
+
+## we will impute the condition section 
+```{r}
+rec_imput <- recipe(color_type~condition+length_m+height_cm+x1+x2,data = df_test) %>% step_knnimpute(all_predictors())
+
+df_test_imputed <- prep(rec_imput) %>% juice()
+df_test_ready <- df_test_imputed %>%
+  select(condition) %>% 
+  bind_cols(df_test %>% select(-condition)) 
+df_test_ready <-  df_test_ready %>% 
+  mutate(issue_date=as.Date(issue_date),
+         listing_date=as.Date(listing_date))
+
+```
+
+```{r}
+pet_recipe <- recipe(color_type~.,data = df_test_ready) %>% 
+  step_rm(x1_2,x2_2) %>% 
+  update_role(pet_id,new_role = "id") %>% 
+  step_date(issue_date,features = c( "month", "year")) %>% 
+  step_date(listing_date,features = c( "month", "year")) %>% 
+  step_rm(listing_date,issue_date) 
+
+df_new_test <- prep(pet_recipe) %>% juice()
+```
+
+
+```{r}
+df_new_test2 <-df_new_test %>%  mutate(listing_date_year=factor(listing_date_year),
+                            issue_date_year=factor(issue_date_year),
+                            height_cm=height_cm) %>% select(-pet_id)
+finalize_model(rand_spec,best_params) %>% fit(breed_category~.,data=df_new) %>% 
+  predict(df_new_test2) %>%
+  bind_cols(df_new_test2)->breed_res
+```
+
+```{r}
+breed <- breed_res %>% 
+  select(pet_id,breed_category=.pred_class)
+
+df_breed <-breed_res %>%  rename(breed_category=.pred_class)
+```
+
+
+<!-- ## Let us now predict pet_category -->
+<!-- ```{r} -->
+<!-- pet_recipe <- recipe(pet_category~.,data = df_train_ready) %>%  -->
+<!--   step_rm(breed_category,x1_2,x2_2,pet_id) %>%  -->
+<!--   step_date(issue_date,features = c("dow", "month", "year")) %>%  -->
+<!--   step_date(listing_date,features = c("dow", "month", "year")) %>%  -->
+<!--   step_rm(listing_date,issue_date) %>%  -->
+<!--   step_other(x1,x2,threshold = 0.07)  -->
+
+<!-- df_new_new <- prep(pet_recipe) %>% juice() -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- breed_res_pet %>% select(pet_id,pet_category=.pred_class) %>%  -->
+<!--   left_join(breed) %>% write_csv("pet_prediction.csv") -->
+<!-- breed %>% left_join(breed_res_pet %>% select(pet_id,pet_category=.pred_class) )%>% write_csv("pet_prediction.csv") -->
+
+<!-- ``` -->
+
+```{r}
+df_new_new %>% bind_cols(df_train %>% select(breed_category))
+```
+
+
+### Tune a random forest model for the pet category
+```{r}
+set.seed(1234)
+pet_folds <- vfold_cv(v =5,strata = pet_category,data = pet_train)
+
+rand_spec <- rand_forest(mtry = tune(),
+            trees = 1000,
+            min_n = tune()) %>% set_mode("classification") %>% 
+  set_engine("ranger")
+
+pet_wf <- workflow() %>% 
+  add_formula(pet_category~.) %>% 
+  add_model(rand_spec)
+
+rand_res <- tune_grid(
+  pet_wf,grid = 5,resamples = pet_folds,
+  control = control_resamples(save_pred = T)
+)
+
+best_params <- rand_res  %>% 
+  select_best("roc_auc")
+
+finalize_model(rand_spec,best_params) %>% fit(pet_category~.,data=pet_train) %>% 
+  predict(pet_test) %>% 
+  bind_cols(pet_test %>% select(pet_category)) %>% conf_mat(.pred_class,pet_category) %>% 
+  summary()
+```
+
+
+```{r}
+finalize_model(rand_spec,best_params) %>% fit(pet_category~.,data=df_new) %>% 
+  predict(df_breed) %>%
+  bind_cols(df_breed)->breed_res_pet
+
+breed_res_pet
+```
+
+
+```{r}
+df_test %>% select(pet_id) %>% 
+  bind_cols(breed_res_pet %>% select(breed_category,pet_category=.pred_class)) %>% 
+  write_csv("pet_pred.csv")
+```
+
+
+
+
