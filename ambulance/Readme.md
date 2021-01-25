@@ -1,0 +1,2 @@
+Use information on thousands of traffic accidents that have occurred in Nairobi,along with supplementary data from Uber Movement, road survey data and weather patterns to identify patterns of risk across the city.
+And determine the best locations to place six virtual ambulances around the city, moving them around throughout the day with the goal of minimising the distance travelled when responding to crashes during the test period.
